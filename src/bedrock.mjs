@@ -76,11 +76,16 @@ function nodeCredentialProvider() {
 const STRIPPED_HEADERS = ["authorization", "x-api-key"];
 
 /**
- * SigV4-signs a Bedrock `invoke`/`invoke-with-response-stream` request. `path` is signed
- * exactly as received (already `encodeURIComponent`-escaped by {@link bedrockPath}), so the
- * signer must not re-escape it — that would turn a real `%3A` into `%253A` and produce a
- * signature Bedrock rejects. `credentials` defaults to the standard AWS provider chain,
- * so a caller running under an SSO session or instance role needs nothing extra.
+ * SigV4-signs a Bedrock `invoke`/`invoke-with-response-stream` request. `path` is the exact
+ * string that goes out on the wire, already `encodeURIComponent`-escaped once by
+ * {@link bedrockPath}. AWS's SigV4 spec calls for URI-escaping each path segment a *second*
+ * time when building the canonical request for every service except S3 — Bedrock is not S3,
+ * so `uriEscapePath` is left at its default (true). Passing `false` here looks like the safe
+ * choice to avoid double-encoding, but it produces a signature real Bedrock rejects with a
+ * 403 "signature we calculated does not match" whose own recomputed canonical string shows
+ * the doubled encoding it expected; confirmed against the live endpoint, not just a stub.
+ * `credentials` defaults to the standard AWS provider chain, so a caller running under an SSO
+ * session or instance role needs nothing extra.
  *
  * @returns {Promise<Record<string,string>>} the full signed header set, including
  *   `authorization`, `x-amz-date` and `host`.
@@ -104,7 +109,6 @@ export async function signRequest({
     region,
     credentials: credentials ?? nodeCredentialProvider(),
     sha256: Sha256,
-    uriEscapePath: false,
   });
   const signed = await signer.sign(
     { method, protocol: "https:", hostname: host, path, headers: toSign, body },

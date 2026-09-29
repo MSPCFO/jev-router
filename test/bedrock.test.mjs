@@ -110,7 +110,14 @@ test("drops any incoming authorization and x-api-key headers before signing", as
   assert.equal(headers["x-api-key"], undefined);
 });
 
-test("does not double-encode a path that already has percent-encoded colons and brackets", async () => {
+test("matches AWS's own canonical-request double-encoding for a path that already has a percent-encoded colon", async () => {
+  // AWS's SigV4 spec double-URI-encodes each path segment when building the canonical
+  // request for every service except S3 — confirmed live against real Bedrock, which
+  // rejected a signature computed with `uriEscapePath: false` (a real "%3A" in the URL,
+  // signed as "%3A" instead of the "%253A" Bedrock's own recomputed canonical string
+  // expected) with a 403 signature mismatch. The transmitted URL itself still only has one
+  // level of encoding, which the proxy tests below confirm by inspecting the literal path a
+  // stub server receives; only the *signature's* canonicalization needs the second pass.
   const path = bedrockPath("us.anthropic.claude-haiku-4-5-20251001-v1:0", "invoke");
   const signingDate = new Date("2026-01-01T00:00:00Z");
   const headers = await signRequest({
@@ -122,10 +129,6 @@ test("does not double-encode a path that already has percent-encoded colons and 
     credentials: CREDENTIALS,
     signingDate,
   });
-  // Re-sign the same request straight through the underlying library with
-  // `uriEscapePath: false`. If signRequest instead let the default `uriEscapePath: true`
-  // apply, it would percent-encode the `%` in the already-encoded path a second time and
-  // produce a different signature from this one, which pins the path down as sent.
   const { SignatureV4 } = await import("@smithy/signature-v4");
   const { Sha256 } = await import("@aws-crypto/sha256-js");
   const signer = new SignatureV4({
@@ -133,7 +136,7 @@ test("does not double-encode a path that already has percent-encoded colons and 
     region: "us-east-1",
     credentials: CREDENTIALS,
     sha256: Sha256,
-    uriEscapePath: false,
+    // Default (true): AWS's standard, non-S3 canonicalization.
   });
   const expected = await signer.sign(
     {
