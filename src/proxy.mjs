@@ -15,6 +15,7 @@ import { askJev } from "./router.mjs";
 import { decide } from "./policy.mjs";
 import { log } from "./log.mjs";
 import { writeDecision, writeStatus } from "./status.mjs";
+import { parseBedrockPath, bedrockPath, signRequest } from "./bedrock.mjs";
 
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 const debug = (line) => process.env.JEV_DEBUG && log(line);
@@ -167,11 +168,16 @@ export function observeModel(state, current) {
 }
 
 
-export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = askJev } = {}) {
+export async function startProxy({ upstreamURL, route = askJev, bedrock } = {}) {
+  const resolvedUpstreamURL =
+    upstreamURL ?? (bedrock ? `https://bedrock-runtime.${bedrock.region}.amazonaws.com` : ANTHROPIC_BASE_URL);
+
   // Tier routed for each conversation's turn in flight, reused by its follow-up requests and
   // by the cache-rebuild guard, which needs to know what the prompt cache was built on.
   const convos = new Map();
-  const catalog = new Map();
+  // Bedrock has no `/v1/models` endpoint to learn the account's exact model ids from, so the
+  // catalog starts pre-filled with what our own settings say each tier's model id is.
+  const catalog = new Map(bedrock?.models?.map((model) => [model.id, model]) ?? []);
   const stateFor = (key) => {
     let s = convos.get(key);
     if (!s) {
@@ -189,10 +195,16 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
     req.on("data", (c) => chunks.push(c));
     req.on("end", async () => {
       let out = Buffer.concat(chunks);
+      // Bedrock carries the model in the path, not the body, and rejects an extra `model`
+      // key, so this is patched in before routing and undone right before the request is
+      // forwarded; everything between sees the same shape as the first-party API.
+      const bedrockRequest = bedrock ? parseBedrockPath(req.url) : null;
+      let outPath = req.url ?? "";
 
-      if (/^\/v1\/messages/.test(req.url ?? "")) {
+      if (bedrock ? bedrockRequest : /^\/v1\/messages/.test(req.url ?? "")) {
         try {
           const body = JSON.parse(out.toString());
+          if (bedrockRequest) body.model = bedrockRequest.model;
           // Claude Code's request shape is undocumented and moves; JEV_DUMP captures it.
           if (process.env.JEV_DUMP) {
             writeFileSync(`${process.env.JEV_DUMP}.${Date.now()}.json`, JSON.stringify(body, null, 2));
@@ -271,32 +283,58 @@ export async function startProxy({ upstreamURL = ANTHROPIC_BASE_URL, route = ask
               writeDecision(sessionOf(body) || key, { tier, ...fresh, at: Date.now() });
             }
           }
+          if (bedrockRequest) {
+            // Move the model back where Bedrock expects it and strip it from the body,
+            // which Bedrock rejects as an unknown field.
+            outPath = bedrockPath(body.model, bedrockRequest.action);
+            delete body.model;
+          }
           out = Buffer.from(JSON.stringify(body));
         } catch (err) {
           debug(`passthrough, could not process body: ${err.message}`);
         }
       }
 
-      const target = new URL(upstreamURL);
+      const target = new URL(resolvedUpstreamURL);
       const transport = target.protocol === "http:" ? http : https;
-      const headers = { ...req.headers, host: target.host };
-      delete headers["content-length"];
-      if (req.method === "GET" && /^\/v1\/models(?:\?|$)/.test(req.url ?? "")) {
-        delete headers["accept-encoding"];
+      let headers;
+      if (bedrock) {
+        // Bedrock signs the exact bytes being sent, so this has to happen last, after the
+        // body has been rewritten and re-serialized above. Only the two headers Bedrock
+        // actually cares about survive; everything else (including whatever SigV4 Claude
+        // Code itself computed) is replaced.
+        const passthrough = {};
+        if (req.headers["content-type"]) passthrough["content-type"] = req.headers["content-type"];
+        if (req.headers["accept"]) passthrough["accept"] = req.headers["accept"];
+        headers = await signRequest({
+          region: bedrock.region,
+          method: req.method,
+          path: outPath,
+          headers: passthrough,
+          body: out,
+          credentials: bedrock.credentials,
+        });
+      } else {
+        headers = { ...req.headers, host: target.host };
+        delete headers["content-length"];
+        if (req.method === "GET" && /^\/v1\/models(?:\?|$)/.test(req.url ?? "")) {
+          delete headers["accept-encoding"];
+        }
+        // Under JEV_DEBUG, ask for an uncompressed stream so the model the API reports can be
+        // read back out of it. Not worth the bandwidth cost in normal operation.
+        if (process.env.JEV_DEBUG) delete headers["accept-encoding"];
       }
-      // Under JEV_DEBUG, ask for an uncompressed stream so the model the API reports can be
-      // read back out of it. Not worth the bandwidth cost in normal operation.
-      if (process.env.JEV_DEBUG) delete headers["accept-encoding"];
       const upstream = transport.request(
         {
           hostname: target.hostname,
           port: target.port || undefined,
-          path: `${target.pathname.replace(/\/$/, "")}${req.url}`,
+          path: bedrock ? outPath : `${target.pathname.replace(/\/$/, "")}${req.url}`,
           method: req.method,
           headers,
         },
         (up) => {
-          const isModels = req.method === "GET" && /^\/v1\/models(?:\?|$)/.test(req.url ?? "");
+          const isModels =
+            !bedrock && req.method === "GET" && /^\/v1\/models(?:\?|$)/.test(req.url ?? "");
           if (isModels) {
             const chunks = [];
             up.on("data", (chunk) => chunks.push(chunk));

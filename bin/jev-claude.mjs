@@ -8,6 +8,7 @@ import { startProxy } from "../src/proxy.mjs";
 import { AUTO_MODEL } from "../src/config.mjs";
 import { readSavedModel, restoreSavedModel } from "../src/settings.mjs";
 import { LOG_FILE } from "../src/log.mjs";
+import { bedrockConfig } from "../src/bedrock.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -122,10 +123,26 @@ if (!claude) {
   process.exit(1);
 }
 
+// Lowest precedence first: our shared settings, then anything project-local, so a project's
+// own `settings.local.json` can override the account-wide Bedrock region or model ids.
+const bedrock = bedrockConfig(process.env, [
+  join(homedir(), ".claude", "settings.json"),
+  join(process.cwd(), ".claude", "settings.json"),
+  join(process.cwd(), ".claude", "settings.local.json"),
+]);
+
 if (process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY) {
-  const { port, close } = await startProxy();
-  env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${port}`;
-  env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
+  const { port, close } = await startProxy(bedrock ? { bedrock } : {});
+  if (bedrock) {
+    // In Bedrock mode Claude Code ignores ANTHROPIC_BASE_URL: it talks to
+    // ANTHROPIC_BEDROCK_BASE_URL and signs requests itself unless auth is skipped, which
+    // would double-sign the request the proxy is about to re-sign for Bedrock.
+    env.ANTHROPIC_BEDROCK_BASE_URL = `http://127.0.0.1:${port}`;
+    env.CLAUDE_CODE_SKIP_BEDROCK_AUTH = "1";
+  } else {
+    env.ANTHROPIC_BASE_URL = `http://127.0.0.1:${port}`;
+    env.CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY = "1";
+  }
   Object.assign(env, autoModelEnv());
   process.on("exit", () => {
     close();
