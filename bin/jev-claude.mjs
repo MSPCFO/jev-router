@@ -8,7 +8,7 @@ import { startProxy } from "../src/proxy.mjs";
 import { AUTO_MODEL } from "../src/config.mjs";
 import { readSavedModel, restoreSavedModel } from "../src/settings.mjs";
 import { LOG_FILE } from "../src/log.mjs";
-import { bedrockConfig } from "../src/bedrock.mjs";
+import { bedrockConfig, bedrockSettingsFiles } from "../src/bedrock.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = dirname(HERE);
@@ -51,7 +51,8 @@ const savedModelBefore = readSavedModel();
  */
 function statusLineArgs() {
   if (process.env.JEV_NO_STATUSLINE) return [];
-  for (const dir of [join(process.cwd(), ".claude"), join(homedir(), ".claude")]) {
+  const userSettingsDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), ".claude");
+  for (const dir of [join(process.cwd(), ".claude"), userSettingsDir]) {
     try {
       if (JSON.parse(readFileSync(join(dir, "settings.json"), "utf8")).statusLine) return [];
     } catch {
@@ -123,13 +124,13 @@ if (!claude) {
   process.exit(1);
 }
 
-// Lowest precedence first: our shared settings, then anything project-local, so a project's
-// own `settings.local.json` can override the account-wide Bedrock region or model ids.
-const bedrock = bedrockConfig(process.env, [
-  join(homedir(), ".claude", "settings.json"),
-  join(process.cwd(), ".claude", "settings.json"),
-  join(process.cwd(), ".claude", "settings.local.json"),
-]);
+// Lowest precedence first: the user's own settings (which live under CLAUDE_CONFIG_DIR when
+// that's set, not always ~/.claude), then anything project-local, so a project's own
+// `settings.local.json` can override the account-wide Bedrock region or model ids.
+const bedrock = bedrockConfig(
+  process.env,
+  bedrockSettingsFiles(process.env, process.cwd(), homedir()),
+);
 
 if (process.env.JEV_API_KEY || process.env.TYPESAFE_API_KEY) {
   const { port, close } = await startProxy(bedrock ? { bedrock } : {});

@@ -6,6 +6,8 @@
  * from the one the rest of jev-router already understands.
  */
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 import { SignatureV4 } from "@smithy/signature-v4";
 import { Sha256 } from "@aws-crypto/sha256-js";
 // The installed SDK (3.972.84) exports the default chain as `defaultProvider`; there is no
@@ -146,6 +148,24 @@ const isOn = (value) => Boolean(value) && value !== "0" && value !== "false";
  *
  * @returns {?{region: string, models: {id: string}[]}}
  */
+/**
+ * The settings files that carry Bedrock configuration, lowest-precedence first: the user's
+ * own settings, then the current project's shared and local settings. `CLAUDE_CONFIG_DIR`
+ * relocates *all* of Claude Code's user-level config away from `~/.claude` — a user running
+ * with it set (as this one does, to switch between multiple Claude identities) has their
+ * real `CLAUDE_CODE_USE_BEDROCK`/`AWS_REGION` in `$CLAUDE_CONFIG_DIR/settings.json`, not
+ * `~/.claude/settings.json`, which would otherwise silently read as "Bedrock is off" in any
+ * project with no `.claude/settings.json` of its own.
+ */
+export function bedrockSettingsFiles(env = {}, cwd = process.cwd(), home = homedir()) {
+  const userSettingsDir = env.CLAUDE_CONFIG_DIR || join(home, ".claude");
+  return [
+    join(userSettingsDir, "settings.json"),
+    join(cwd, ".claude", "settings.json"),
+    join(cwd, ".claude", "settings.local.json"),
+  ];
+}
+
 export function bedrockConfig(env = {}, settingsFiles = []) {
   const settingsEnv = mergedSettingsEnv(settingsFiles);
   if (!isOn(env.CLAUDE_CODE_USE_BEDROCK) && !isOn(settingsEnv.CLAUDE_CODE_USE_BEDROCK)) return null;

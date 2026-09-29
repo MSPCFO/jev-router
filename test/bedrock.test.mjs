@@ -10,6 +10,7 @@ import {
   bedrockModels,
   signRequest,
   bedrockConfig,
+  bedrockSettingsFiles,
 } from "../src/bedrock.mjs";
 import { tierOf } from "../src/config.mjs";
 import { startProxy } from "../src/proxy.mjs";
@@ -340,4 +341,30 @@ test("bedrockConfig's models come from settings and env default-model settings, 
 
 test("a missing or unreadable settings file is not an error", () => {
   assert.doesNotThrow(() => bedrockConfig({ CLAUDE_CODE_USE_BEDROCK: "1" }, [MISSING_FILE]));
+});
+
+test("bedrockSettingsFiles falls back to ~/.claude when CLAUDE_CONFIG_DIR is unset", () => {
+  const files = bedrockSettingsFiles({}, "/work/repo", "/Users/kpheasey");
+  assert.deepEqual(files, [
+    "/Users/kpheasey/.claude/settings.json",
+    "/work/repo/.claude/settings.json",
+    "/work/repo/.claude/settings.local.json",
+  ]);
+});
+
+test("bedrockSettingsFiles reads the user settings from CLAUDE_CONFIG_DIR when it is set", () => {
+  // This user runs Claude Code with CLAUDE_CONFIG_DIR set to a non-default directory; that
+  // directory's settings.json, not ~/.claude/settings.json, is where CLAUDE_CODE_USE_BEDROCK
+  // and AWS_REGION actually live. Hard-coding ~/.claude here would make bedrockConfig() blind
+  // to Bedrock being on whenever a project has no .claude/settings.json of its own.
+  const files = bedrockSettingsFiles(
+    { CLAUDE_CONFIG_DIR: "/Users/kpheasey/.claude-mspcfo" },
+    "/work/repo",
+    "/Users/kpheasey",
+  );
+  assert.deepEqual(files, [
+    "/Users/kpheasey/.claude-mspcfo/settings.json",
+    "/work/repo/.claude/settings.json",
+    "/work/repo/.claude/settings.local.json",
+  ]);
 });
