@@ -55,3 +55,49 @@ test("the switch file defaults to routing.json under JEV_HOME", (t) => {
   });
   assert.equal(switchFile(), join("/tmp/some-jev-home", "routing.json"));
 });
+
+// --- bin/jev-routing.mjs ---
+
+import { spawnSync } from "node:child_process";
+import { dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROUTING_CLI = join(dirname(fileURLToPath(import.meta.url)), "..", "bin", "jev-routing.mjs");
+
+function routingCli(t, ...args) {
+  const file = withSwitchFile(t);
+  const run = (...a) =>
+    spawnSync(process.execPath, [ROUTING_CLI, ...a], {
+      env: { ...process.env, JEV_STATE_FILE: file },
+      encoding: "utf8",
+    });
+  return { file, run };
+}
+
+test("`on` / `off` write the file and print the new state", (t) => {
+  const { file, run } = routingCli(t);
+  const off = run("off");
+  assert.equal(off.status, 0);
+  assert.match(off.stdout, /routing: off/);
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { routing: "off" });
+  const on = run("on");
+  assert.equal(on.status, 0);
+  assert.match(on.stdout, /routing: on/);
+  assert.deepEqual(JSON.parse(readFileSync(file, "utf8")), { routing: "on" });
+});
+
+test("`status` (and no argument) prints the current state", (t) => {
+  const { run } = routingCli(t);
+  assert.match(run("status").stdout, /routing: on/);
+  run("off");
+  assert.match(run("status").stdout, /routing: off/);
+  assert.match(run().stdout, /routing: off/);
+});
+
+test("an unknown argument prints usage to stderr and exits 1", (t) => {
+  const { run } = routingCli(t);
+  const result = run("sideways");
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /usage/i);
+  assert.equal(result.stdout, "");
+});
