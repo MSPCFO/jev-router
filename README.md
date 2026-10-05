@@ -136,6 +136,42 @@ may also remove them during normal temporary-file cleanup.
 > Choosing a model with `Enter` can save it as Claude Code's default. `jev-claude` restores
 > the previous default on exit so `jev-router` cannot break plain `claude`.
 
+## Daemon mode and the routing switch
+
+`jev-claude` starts a private proxy for one session and stops it on exit. To use Jev from a
+plain `claude` (the CLI or the VS Code extension) there is also a shared, long-lived proxy and a
+per-user routing switch. `jev-claude` is unchanged and keeps working as before.
+
+```bash
+node bin/jev-daemon.mjs ensure --project <dir>   # start the proxy, or restart it if it runs old code
+node bin/jev-daemon.mjs status                   # JSON; exit 0 when running, 3 when not
+node bin/jev-daemon.mjs stop
+
+node bin/jev-routing.mjs on | off | status       # the routing switch
+```
+
+Claude Code reads its endpoint only at session start, so a session that should be routable
+starts pointed at the daemon (`ANTHROPIC_BEDROCK_BASE_URL=http://127.0.0.1:47823` with
+`CLAUDE_CODE_SKIP_BEDROCK_AUTH=1` in Bedrock mode). After that, turning routing on or off happens
+inside the proxy. While routing is off, requests for the `jev-router` model go to the Opus tier
+without asking Jev, and the status line shows `⏸ jev off`. The switch is checked on every fresh
+turn, so it applies from the next prompt and affects every session that uses the proxy.
+
+| Thing | Value |
+| --- | --- |
+| Daemon address | `127.0.0.1`, port `47823`, override with `JEV_PORT` |
+| Health endpoint | `GET /jev/health` returns `{"jev":true,"sha":"<git HEAD or null>","pid":<pid>}` |
+| Daemon state file | `~/.jev-router/daemon.json` (`pid`, `port`, `sha`, `project`, `startedAt`), mode 600 |
+| Daemon log | `~/.jev-router/daemon.log` |
+| Routing switch | `~/.jev-router/routing.json`, `{"routing":"on"\|"off"}`, mode 600; a missing or malformed file means on |
+| Base directory | `~/.jev-router`, override with `JEV_HOME`; the switch file alone with `JEV_STATE_FILE` |
+
+The daemon reads the Bedrock region and model ids from the project's `.claude/settings.json`
+and `settings.local.json` (and the user settings), and the TypeSafe key from the same places
+`jev-claude` does (`.env` in the project, `~/.jev-router.env`, `~/.jev-claude.env`). It listens
+on loopback only; like `jev-claude`, any local process can use it to call Bedrock with your AWS
+credentials, so treat it accordingly.
+
 ## OpenAI Codex interface
 
 ![Jev Router in the OpenAI Codex model picker](docs/codex-model-picker.png)
