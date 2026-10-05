@@ -16,6 +16,7 @@ import { decide } from "./policy.mjs";
 import { log } from "./log.mjs";
 import { writeDecision, writeStatus } from "./status.mjs";
 import { parseBedrockPath, bedrockPath, signRequest } from "./bedrock.mjs";
+import { routingEnabled } from "./routing-switch.mjs";
 
 const ANTHROPIC_BASE_URL = "https://api.anthropic.com";
 const debug = (line) => process.env.JEV_DEBUG && log(line);
@@ -168,7 +169,14 @@ export function observeModel(state, current) {
 }
 
 
-export async function startProxy({ upstreamURL, route = askJev, bedrock } = {}) {
+export async function startProxy({
+  upstreamURL,
+  route = askJev,
+  bedrock,
+  port = 0,
+  host = "127.0.0.1",
+  sha,
+} = {}) {
   const resolvedUpstreamURL =
     upstreamURL ?? (bedrock ? `https://bedrock-runtime.${bedrock.region}.amazonaws.com` : ANTHROPIC_BASE_URL);
 
@@ -190,6 +198,12 @@ export async function startProxy({ upstreamURL, route = askJev, bedrock } = {}) 
   const server = http.createServer((req, res) => {
     // Claude Code probes the base URL before its first request.
     if (req.method === "HEAD") return res.writeHead(200).end();
+
+    // Lets `jev-daemon` tell a live router from a stale pid or an unrelated listener.
+    if (req.method === "GET" && (req.url ?? "").split("?")[0] === "/jev/health") {
+      res.writeHead(200, { "content-type": "application/json" });
+      return res.end(JSON.stringify({ jev: true, sha: sha ?? null, pid: process.pid }));
+    }
 
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
@@ -236,36 +250,51 @@ export async function startProxy({ upstreamURL, route = askJev, bedrock } = {}) 
               const available = [...new Set(models.map((model) => model.tier))];
               const currentModel = state.model ?? modelForTier(models, current);
               const contextTokens = Math.round(JSON.stringify(body.messages).length / 4);
-              const jev = await route({ prompt, current: currentModel, contextTokens, models });
-              const chosen = models.find((model) => model.id === jev?.choice);
-              const tierAnswer = jev && { ...jev, choice: chosen?.tier };
-              const { tier, reason } = decide({
-                prompt,
-                jev: tierAnswer,
-                current,
-                available,
-                contextTokens,
-              });
-              const model =
-                shouldUseExactModel(reason, chosen?.tier, tier)
-                  ? chosen.id
-                  : tier === current
-                    ? currentModel
-                    : modelForTier(models, tier);
-              state.tier = tier;
-              state.model = model;
-              fresh = {
-                prompt,
-                model,
-                confidence: jev?.confidence ?? null,
-                metrics: jev?.metrics ?? null,
-                reason,
-                jev: jev ? { request: jev.request, response: jev.response } : null,
-              };
-              debug(
-                `${key} ${jev ? `${jev.ms}ms p=${jev.confidence.toFixed(2)}` : "no-jev"} ` +
-                  `${current} -> ${tier} (${reason}) ctx~${contextTokens} | ${prompt.slice(0, 60)}`,
-              );
+              if (!routingEnabled()) {
+                // The user turned routing off: keep the session on the Opus tier and never
+                // call Jev. The status line shows this as "jev off".
+                state.tier = "opus";
+                state.model = modelForTier(models, "opus");
+                fresh = {
+                  prompt,
+                  model: state.model,
+                  confidence: null,
+                  metrics: null,
+                  reason: "off",
+                  jev: null,
+                };
+              } else {
+                const jev = await route({ prompt, current: currentModel, contextTokens, models });
+                const chosen = models.find((model) => model.id === jev?.choice);
+                const tierAnswer = jev && { ...jev, choice: chosen?.tier };
+                const { tier, reason } = decide({
+                  prompt,
+                  jev: tierAnswer,
+                  current,
+                  available,
+                  contextTokens,
+                });
+                const model =
+                  shouldUseExactModel(reason, chosen?.tier, tier)
+                    ? chosen.id
+                    : tier === current
+                      ? currentModel
+                      : modelForTier(models, tier);
+                state.tier = tier;
+                state.model = model;
+                fresh = {
+                  prompt,
+                  model,
+                  confidence: jev?.confidence ?? null,
+                  metrics: jev?.metrics ?? null,
+                  reason,
+                  jev: jev ? { request: jev.request, response: jev.response } : null,
+                };
+                debug(
+                  `${key} ${jev ? `${jev.ms}ms p=${jev.confidence.toFixed(2)}` : "no-jev"} ` +
+                    `${current} -> ${tier} (${reason}) ctx~${contextTokens} | ${prompt.slice(0, 60)}`,
+                );
+              }
             }
             // The sentinel is not a real model, so every routed request must be rewritten,
             // including follow-ups that reuse the tier chosen for the turn.
@@ -280,7 +309,12 @@ export async function startProxy({ upstreamURL, route = askJev, bedrock } = {}) 
             // key is stable for the same conversation and is already what `debug` prints, so
             // it is the identifier a user can pass to `jev-explain` for a print-mode run.
             if (fresh && !explaining) {
-              writeDecision(sessionOf(body) || key, { tier, ...fresh, at: Date.now() });
+              writeDecision(sessionOf(body) || key, {
+                tier,
+                ...fresh,
+                ...(fresh.reason === "off" ? { off: true } : {}),
+                at: Date.now(),
+              });
             }
           }
           if (bedrockRequest) {
@@ -381,6 +415,12 @@ export async function startProxy({ upstreamURL, route = askJev, bedrock } = {}) 
     });
   });
 
-  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  await new Promise((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(port, host, () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
   return { port: server.address().port, close: () => server.close() };
 }

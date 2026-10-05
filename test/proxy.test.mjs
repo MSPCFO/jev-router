@@ -23,8 +23,13 @@ test("the sentinel is not mistaken for a real tier", () => {
 });
 import { tierOf, isAuto } from "../src/config.mjs";
 import { writeDecision, writeStatus, readStatus, pruneStale, STATUS_DIR } from "../src/status.mjs";
-import { mkdirSync, statSync, utimesSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, statSync, utimesSync, writeFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
+
+// Never read the real routing switch in ~/.jev-router: an "off" there would change what the
+// routing tests below see. The file does not exist, so routing reads as on.
+process.env.JEV_STATE_FILE = join(mkdtempSync(join(tmpdir(), "jev-proxy-default-")), "routing.json");
 
 test("reads the session id out of Claude Code's metadata", () => {
   const sid = "11111111-2222-4333-8444-555555555555";
@@ -354,4 +359,128 @@ test("the same opening text in two sessions gets two keys", () => {
 test("the key survives metadata that is not JSON", () => {
   const body = { metadata: { user_id: "not-json" }, messages: [{ role: "user", content: "hi" }] };
   assert.doesNotThrow(() => conversationKey(body));
+});
+
+// --- routing switch, health endpoint and listen port ---
+
+import net from "node:net";
+import { idOf } from "../src/config.mjs";
+import { setRouting } from "../src/routing-switch.mjs";
+
+function useSwitchFile(t) {
+  const previous = process.env.JEV_STATE_FILE;
+  process.env.JEV_STATE_FILE = join(mkdtempSync(join(tmpdir(), "jev-proxy-")), "routing.json");
+  t.after(() => {
+    if (previous === undefined) delete process.env.JEV_STATE_FILE;
+    else process.env.JEV_STATE_FILE = previous;
+  });
+}
+
+async function recordingUpstream(t) {
+  const seen = [];
+  const upstream = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (chunk) => chunks.push(chunk));
+    req.on("end", () => {
+      seen.push(JSON.parse(Buffer.concat(chunks)));
+      res.setHeader("content-type", "application/json");
+      res.end('{"id":"msg_1","type":"message"}');
+    });
+  });
+  await new Promise((resolve) => upstream.listen(0, "127.0.0.1", resolve));
+  t.after(() => upstream.close());
+  return { seen, url: `http://127.0.0.1:${upstream.address().port}` };
+}
+
+const sentinelTurn = (text, sid) => ({
+  model: "jev-router",
+  tools: [{ name: "Bash" }],
+  ...(sid ? { metadata: { user_id: JSON.stringify({ session_id: sid }) } } : {}),
+  messages: [{ role: "user", content: text }],
+});
+
+const post = (port, body) =>
+  fetch(`http://127.0.0.1:${port}/v1/messages`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+test("when routing is off, Jev is not called and the sentinel is sent as the opus model", async (t) => {
+  useSwitchFile(t);
+  setRouting(false);
+  const { seen, url } = await recordingUpstream(t);
+  const { port, close } = await startProxy({
+    upstreamURL: url,
+    route: async () => {
+      throw new Error("route must not be called while routing is off");
+    },
+  });
+  t.after(close);
+
+  await post(port, sentinelTurn(`off turn ${process.pid}`));
+  assert.equal(seen[0].model, idOf("opus"));
+});
+
+test("when routing is off, the session status records off: true", async (t) => {
+  useSwitchFile(t);
+  setRouting(false);
+  const { url } = await recordingUpstream(t);
+  const { port, close } = await startProxy({
+    upstreamURL: url,
+    route: async () => {
+      throw new Error("route must not be called while routing is off");
+    },
+  });
+  t.after(close);
+
+  const sid = `off-${process.pid}-${Date.now()}`;
+  await post(port, sentinelTurn("do a thing", sid));
+  const status = readStatus(sid);
+  assert.equal(status.off, true);
+  assert.equal(status.model, idOf("opus"));
+});
+
+test("turning routing back on routes the next fresh turn", async (t) => {
+  useSwitchFile(t);
+  setRouting(false);
+  const { seen, url } = await recordingUpstream(t);
+  let routed = 0;
+  const { port, close } = await startProxy({
+    upstreamURL: url,
+    route: async () => {
+      routed++;
+      return { choice: "claude-sonnet-5", confidence: 0.9, ms: 1 };
+    },
+  });
+  t.after(close);
+
+  const sid = `toggle-${process.pid}-${Date.now()}`;
+  await post(port, sentinelTurn("first turn", sid));
+  assert.equal(routed, 0);
+  setRouting(true);
+  await post(port, sentinelTurn("second turn", sid));
+  assert.equal(routed, 1);
+  assert.equal(seen[1].model, "claude-sonnet-5");
+});
+
+test("GET /jev/health answers jev:true with the sha it was started with", async (t) => {
+  const { port, close } = await startProxy({ upstreamURL: "http://127.0.0.1:9", sha: "abc" });
+  t.after(close);
+  const response = await fetch(`http://127.0.0.1:${port}/jev/health`);
+  assert.equal(response.status, 200);
+  assert.deepEqual(await response.json(), { jev: true, sha: "abc", pid: process.pid });
+});
+
+test("startProxy listens on the requested port", async (t) => {
+  const free = await new Promise((resolve) => {
+    const probe = net.createServer();
+    probe.listen(0, "127.0.0.1", () => {
+      const { port } = probe.address();
+      probe.close(() => resolve(port));
+    });
+  });
+  const { port, close } = await startProxy({ upstreamURL: "http://127.0.0.1:9", port: free });
+  t.after(close);
+  assert.equal(port, free);
 });
