@@ -23,7 +23,10 @@ const dir = (input.workspace?.current_dir ?? input.cwd ?? "").split(/[\\/]/).pop
 const pct = Math.round(input.context_window?.used_percentage ?? 0);
 
 let routed = `${DIM}jev: waiting for first prompt${RESET}`;
-if (status?.manual) {
+if (status?.off) {
+  // Routing is switched off (`jev-routing off`), so every turn goes to the Opus tier.
+  routed = `${DIM}⏸ jev off${RESET} ${status.model ?? ""}`.trimEnd();
+} else if (status?.manual) {
   // The user picked this model with /model, so show their choice rather than a tier.
   routed = `${DIM}⏸ manual${RESET} ${input.model?.display_name ?? ""}`.trimEnd();
 } else if (status) {
@@ -34,6 +37,7 @@ if (status?.manual) {
   const held =
     status.reason &&
     status.reason !== "jev" &&
+    status.reason !== "off" &&
     status.reason !== "jev/no-change" &&
     !status.reason.includes("override");
   const why = held ? ` ${DIM}(${status.reason.split("/")[0]})${RESET}` : "";
